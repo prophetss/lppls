@@ -7,13 +7,52 @@ import random
 from datetime import datetime as date
 from pandas._libs.tslibs.np_datetime import OutOfBoundsDatetime
 from scipy.optimize import minimize
+from abc import ABC, abstractmethod
+import pickle
 from tqdm import tqdm
+import hashlib
 import xarray as xr
+import os
 
+
+class FilterConditionsConfigBase(ABC):
+    @abstractmethod
+    def is_qualified(self, t1, t2, tc, m, w, b, c, O, D):
+        pass
+    
+
+class DefaultFilterConditionsConfig(FilterConditionsConfigBase):
+    m_min = 0.0
+    m_max = 1.0
+    w_min = 2.0
+    w_max = 15.0
+    O_min = 2.5
+    D_min = 0.5
+
+    def is_qualified(self, t1, t2, tc, m, w, b, c, O, D):
+        tc_in_range = (
+            max(t2 - 60, t2 - 0.5 * (t2 - t1))
+            < tc
+            < min(t2 + 252, t2 + 0.5 * (t2 - t1))
+        )
+        m_in_range = self.m_min < m < self.m_max
+        w_in_range = self.w_min < w < self.w_max
+
+        if b != 0 and c != 0:
+            O = O
+        else:
+            O = np.inf
+
+        O_in_range = O > self.O_min
+        D_in_range = D > self.D_min  # if m > 0 and w > 0 else False
+        return tc_in_range and m_in_range and w_in_range and O_in_range and D_in_range
+            
 
 class LPPLS(object):
+    
+    model_save_path = f'{os.path.expanduser('~')}/.cache/lppls'
 
-    def __init__(self, observations):
+    def __init__(self, observations, enable_model_cache=True):
         """
         Args:
             observations (np.array,pd.DataFrame): 2xM matrix with timestamp and observed value.
@@ -25,6 +64,10 @@ class LPPLS(object):
         self.observations = observations
         self.coef_ = {}
         self.indicator_result = []
+        self.tc_bound_coef = (0.2, 0.2)
+        self.m_range = (0.1, 1.0)
+        self.w_range = (6.0, 13.0)
+        self.enable_model_cache = enable_model_cache
 
     @staticmethod
     @njit
@@ -105,6 +148,26 @@ class LPPLS(object):
         matrix_1 += 1e-8 * np.eye(matrix_1.shape[0])
 
         return np.linalg.solve(matrix_1, matrix_2)
+    
+    def model_path(self, minimizer):
+        mp = f'{self.model_save_path}/{minimizer}/tc_{self.tc_bound_coef[0]}_{self.tc_bound_coef[1]}/m_{self.m_range[0]}_{self.m_range[1]}/w_{self.w_range[0]}_{self.w_range[1]}/'
+        os.makedirs(mp, exist_ok=True)
+        return mp
+    
+    def save_model(self, minimizer, obs, coef):
+        mp = self.model_path(minimizer)
+        sha1 = hashlib.sha1(obs.tobytes()).hexdigest()
+        with open(f'{mp}/{sha1}.pkl', 'wb') as f:
+            pickle.dump(coef, f)
+
+    def load_model(self, minimizer, obs):
+        mp = self.model_path(minimizer)
+        sha1 = hashlib.sha1(obs.tobytes()).hexdigest()
+        fp = f'{mp}/{sha1}.pkl'
+        if os.path.exists(fp):
+            with open(fp, 'rb') as f:
+                return pickle.load(f)
+        return None
 
     def fit(self, max_searches, minimizer="Nelder-Mead", obs=None):
         """
@@ -128,11 +191,12 @@ class LPPLS(object):
 
             # @TODO make configurable
             # set random initialization limits for non-linear params
+            tc_low_coef, tc_up_coef = self.tc_bound_coef
             init_limits = [
                 # (tc_init_min, tc_init_max),
-                (t2 - 0.2 * (t2 - t1), t2 + 0.2 * (t2 - t1)),  # tc
-                (0.1, 1.0),  # m
-                (6.0, 13.0),  # ω
+                (t2 - tc_low_coef * (t2 - t1), t2 + tc_up_coef * (t2 - t1)),  # tc
+                self.m_range,
+                self.w_range
             ]
 
             # randomly choose vals within bounds for non-linear params
@@ -164,6 +228,12 @@ class LPPLS(object):
         Returns:
             tc, m, w, a, b, c, c1, c2
         """
+        
+        coef_names = ["tc", "m", "w", "a", "b", "c", "c1", "c2"]
+        if self.enable_model_cache:
+            coef = self.load_model(observations, minimizer)
+            if coef is not None:
+                return (coef[key] for key in coef_names)
 
         cofs = minimize(
             args=observations, fun=self.func_restricted, x0=seed, method=minimizer
@@ -183,8 +253,10 @@ class LPPLS(object):
 
             # Use sklearn format for storing fit params
             # @TODO only save when running single fits.
-            for coef in ["tc", "m", "w", "a", "b", "c", "c1", "c2"]:
+            for coef in coef_names:
                 self.coef_[coef] = eval(coef)
+            if self.enable_model_cache:
+                self.save_model(minimizer, observations, self.coef_)
             return tc, m, w, a, b, c, c1, c2
         else:
             raise UnboundLocalError
@@ -234,7 +306,8 @@ class LPPLS(object):
         # # axes up to make room for them
         # fig.autofmt_xdate()
 
-    def compute_indicators(self, res, filter_conditions_config=None):
+            
+    def compute_indicators(self, res, filter_cls: FilterConditionsConfigBase = DefaultFilterConditionsConfig):
         pos_lst = []
         neg_lst = []
         pos_conf_lst = []
@@ -243,15 +316,7 @@ class LPPLS(object):
         ts = []
         _fits = []
 
-        if filter_conditions_config is None:
-            # TODO make configurable again!
-            m_min, m_max = (0.0, 1.0)
-            w_min, w_max = (2.0, 15.0)
-            O_min = 2.5
-            D_min = 0.5
-        else:
-            # TODO parse user provided conditions
-            pass
+        filter_conditions_config = filter_cls()
 
         for r in res:
             ts.append(r["t2"])
@@ -287,29 +352,7 @@ class LPPLS(object):
                 # print('{} < {} < {}'.format(max(t2 - 60, t2 - 0.5 * (t2 - t1)), tc, min(t2 + 252, t2 + 0.5 * (t2 - t1))))
                 # print('______________')
 
-                tc_in_range = (
-                    max(t2 - 60, t2 - 0.5 * (t2 - t1))
-                    < tc
-                    < min(t2 + 252, t2 + 0.5 * (t2 - t1))
-                )
-                m_in_range = m_min < m < m_max
-                w_in_range = w_min < w < w_max
-
-                if b != 0 and c != 0:
-                    O = O
-                else:
-                    O = np.inf
-
-                O_in_range = O > O_min
-                D_in_range = D > D_min  # if m > 0 and w > 0 else False
-
-                if (
-                    tc_in_range
-                    and m_in_range
-                    and w_in_range
-                    and O_in_range
-                    and D_in_range
-                ):
+                if filter_conditions_config.is_qualified(t1, t2, tc, m, w, b, c, O, D):
                     is_qualified = True
                 else:
                     is_qualified = False
@@ -353,7 +396,7 @@ class LPPLS(object):
         return res_df
         # return ts, price, pos_lst, neg_lst, pos_conf_lst, neg_conf_lst, #tc_lst, m_lst, w_lst, O_lst, D_lst
 
-    def plot_confidence_indicators(self, res):
+    def plot_confidence_indicators(self, res, filter_cls: FilterConditionsConfigBase = DefaultFilterConditionsConfig):
         """
         Args:
             res (list): result from mp_compute_indicator
@@ -362,7 +405,7 @@ class LPPLS(object):
         Returns:
             nothing, should plot the indicator
         """
-        res_df = self.compute_indicators(res)
+        res_df = self.compute_indicators(res, filter_cls)
         fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, sharex=True, figsize=(18, 10))
 
         ord = res_df["time"].astype("int32")
