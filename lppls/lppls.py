@@ -6,7 +6,7 @@ import pandas as pd
 import random
 from datetime import datetime as date
 from pandas._libs.tslibs.np_datetime import OutOfBoundsDatetime
-from scipy.optimize import minimize
+from scipy.optimize import minimize, Bounds
 from abc import ABC, abstractmethod
 import pickle
 from tqdm import tqdm
@@ -50,7 +50,8 @@ class DefaultFilterConditionsConfig(FilterConditionsConfigBase):
 
 class LPPLS(object):
     
-    model_save_path = f'{os.path.expanduser('~')}/.cache/lppls'
+    home_dir = os.path.expanduser('~')
+    model_save_path = f'{home_dir}/.cache/lppls'
 
     def __init__(self, observations, enable_model_cache=True):
         """
@@ -154,13 +155,13 @@ class LPPLS(object):
         os.makedirs(mp, exist_ok=True)
         return mp
     
-    def save_model(self, minimizer, obs, coef):
+    def save_model(self, obs, minimizer, coef):
         mp = self.model_path(minimizer)
         sha1 = hashlib.sha1(obs.tobytes()).hexdigest()
         with open(f'{mp}/{sha1}.pkl', 'wb') as f:
             pickle.dump(coef, f)
 
-    def load_model(self, minimizer, obs):
+    def load_model(self, obs, minimizer):
         mp = self.model_path(minimizer)
         sha1 = hashlib.sha1(obs.tobytes()).hexdigest()
         fp = f'{mp}/{sha1}.pkl'
@@ -234,9 +235,11 @@ class LPPLS(object):
             coef = self.load_model(observations, minimizer)
             if coef is not None:
                 return (coef[key] for key in coef_names)
+        
+        bounds = Bounds([observations[0, -1]+1e-8, -np.inf, -np.inf], [np.inf,np.inf,np.inf])
 
         cofs = minimize(
-            args=observations, fun=self.func_restricted, x0=seed, method=minimizer
+            args=observations, fun=self.func_restricted, x0=seed, method=minimizer, bounds=bounds
         )
 
         if cofs.success:
@@ -256,7 +259,7 @@ class LPPLS(object):
             for coef in coef_names:
                 self.coef_[coef] = eval(coef)
             if self.enable_model_cache:
-                self.save_model(minimizer, observations, self.coef_)
+                self.save_model(observations, minimizer, self.coef_)
             return tc, m, w, a, b, c, c1, c2
         else:
             raise UnboundLocalError
