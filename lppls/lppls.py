@@ -207,10 +207,14 @@ class LPPLS(object):
             m = non_lin_vals[1]
             w = non_lin_vals[2]
             seed = np.array([tc, m, w])
+            
+            # epsilon = 1e-8
+            # bounds = Bounds([t2+epsilon, -np.inf, -np.inf], [np.inf,np.inf,np.inf])
+            bounds = None
 
             # Increment search count on SVD convergence error, but raise all other exceptions.
             try:
-                tc, m, w, a, b, c, c1, c2 = self.estimate_params(obs, seed, minimizer)
+                tc, m, w, a, b, c, c1, c2 = self.estimate_params(obs, seed, minimizer, bounds)
                 O = self.get_oscillations(w, tc, t1, t2)
                 D = self.get_damping(m, w, b, c)
                 return tc, m, w, a, b, c, c1, c2, O, D
@@ -219,7 +223,7 @@ class LPPLS(object):
                 search_count += 1
         return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
-    def estimate_params(self, observations, seed, minimizer):
+    def estimate_params(self, observations, seed, minimizer, bounds):
         """
         Args:
             observations (np.ndarray):  the observed time-series data.
@@ -236,8 +240,6 @@ class LPPLS(object):
             if coef is not None:
                 return (coef[key] for key in coef_names)
         
-        bounds = Bounds([observations[0, -1]+1e-8, -np.inf, -np.inf], [np.inf,np.inf,np.inf])
-
         cofs = minimize(
             args=observations, fun=self.func_restricted, x0=seed, method=minimizer, bounds=bounds
         )
@@ -389,7 +391,7 @@ class LPPLS(object):
 
         res_df = pd.DataFrame(
             {
-                "time": ts,
+                "time": [date.fromordinal(int(t)) for t in ts],
                 "price": price,
                 "pos_conf": pos_conf_lst,
                 "neg_conf": neg_conf_lst,
@@ -398,7 +400,13 @@ class LPPLS(object):
         )
         return res_df
         # return ts, price, pos_lst, neg_lst, pos_conf_lst, neg_conf_lst, #tc_lst, m_lst, w_lst, O_lst, D_lst
-
+        
+    def plot_estimate_params(self, r:xr.DataArray):
+        fig, axs = plt.subplots(8, 1, figsize=(36, 20))
+        for i, param in enumerate(["a", "b", "c", "m", "w"]):
+            axs[i].plot(r.loc[0,:,param])
+        plt.tight_layout()
+                
     def plot_confidence_indicators(self, res, filter_cls: FilterConditionsConfigBase = DefaultFilterConditionsConfig):
         """
         Args:
@@ -523,6 +531,7 @@ class LPPLS(object):
         res = []
         i_idx = 0
         for i in range(0, obs_copy_len + 1, outer_increment):
+            print(i)
             j_idx = 0
             obs = obs_copy[:, i : window_size + i]
             t1 = obs[0][0]
@@ -531,12 +540,12 @@ class LPPLS(object):
             i_idx += 1
             for j in range(0, window_delta, inner_increment):
                 obs_shrinking_slice = obs[:, j:window_size]
-                tc, m, w, a, b, c, _, _, _, _ = self.fit(
+                tc, m, w, a, b, c, c1, c2, O, D = self.fit(
                     max_searches, obs=obs_shrinking_slice
                 )
                 res[i_idx - 1].append([])
                 j_idx += 1
-                for k in [t2, t1, a, b, c, m, 0, tc]:
+                for k in [t2, t1, a, b, c, m, w, tc, c1, c2, O, D]:
                     res[i_idx - 1][j_idx - 1].append(k)
         return xr.DataArray(
             data=res,
@@ -544,7 +553,7 @@ class LPPLS(object):
             coords=dict(
                 t2=obs_copy[0][(window_size - 1) :],
                 windowsizes=range(smallest_window_size, window_size, inner_increment),
-                params=["t2", "t1", "a", "b", "c", "m", "0", "tc"],
+                params=["t2", "t1", "a", "b", "c", "m", "w", "tc", "c1", "c2", "O", "D"],
             ),
         )
 
@@ -660,7 +669,7 @@ class LPPLS(object):
         return False if m <= 0 or w <= 0 else abs((m * b) / (w * c)) > D_min
 
     def get_oscillations(self, w, tc, t1, t2):
-        return (w / (2.0 * np.pi)) * np.log((tc - t1) / (tc - t2))
+        return (w / (2.0 * np.pi)) * np.log(np.abs((tc - t1) / (tc - t2)))
 
     def get_damping(self, m, w, b, c):
         return (m * np.abs(b)) / (w * np.abs(c))
