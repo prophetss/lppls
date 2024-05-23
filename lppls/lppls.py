@@ -29,7 +29,7 @@ class DefaultFilterConditionsConfig(FilterConditionsConfigBase):
     w_max = 15.0
     O_min = 2.5
     D_min = 0.5
-    
+
     fromordinal = date.fromordinal
 
     def is_qualified(self, t1, t2, tc, m, w, b, c, O, D):
@@ -325,7 +325,6 @@ class LPPLS(object):
             pos_count = 0
             neg_count = 0
             # _fits.append(r['res'])
-            qualified_tc = []
 
             for idx, fits in enumerate(r["res"]):
                 t1 = fits["t1"]
@@ -353,13 +352,6 @@ class LPPLS(object):
                 # print('______________')
 
                 if filter_conditions_config.is_qualified(t1, t2, tc, m, w, b, c, O, D):
-                    qualified_tc.append(
-                        (
-                            filter_cls.fromordinal(int(tc)),
-                            filter_cls.fromordinal(int(t2)),
-                            filter_cls.fromordinal(int(t1)),
-                        )
-                    )
                     is_qualified = True
                 else:
                     is_qualified = False
@@ -385,7 +377,7 @@ class LPPLS(object):
             # pos_lst.append(pos_count / (pos_count + neg_count))
             # neg_lst.append(neg_count / (pos_count + neg_count))
 
-            tc_lst.append(qualified_tc)
+            # tc_lst.append(tc_cnt)
             # m_lst.append(m_cnt)
             # w_lst.append(w_cnt)
             # O_lst.append(O_cnt)
@@ -394,7 +386,6 @@ class LPPLS(object):
         res_df = pd.DataFrame(
             {
                 "time": ts,
-                "tc_lst":tc_lst,
                 "price": price,
                 "pos_conf": pos_conf_lst,
                 "neg_conf": neg_conf_lst,
