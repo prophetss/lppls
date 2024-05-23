@@ -1,3 +1,4 @@
+import functools
 from multiprocessing import Pool
 from matplotlib import pyplot as plt
 from numba import njit
@@ -19,7 +20,7 @@ class FilterConditionsConfigBase(ABC):
     @abstractmethod
     def is_qualified(self, t1, t2, tc, m, w, b, c, O, D):
         pass
-    
+
 
 class DefaultFilterConditionsConfig(FilterConditionsConfigBase):
     m_min = 0.0
@@ -28,6 +29,8 @@ class DefaultFilterConditionsConfig(FilterConditionsConfigBase):
     w_max = 15.0
     O_min = 2.5
     D_min = 0.5
+    
+    fromordinal = date.fromordinal
 
     def is_qualified(self, t1, t2, tc, m, w, b, c, O, D):
         tc_in_range = (
@@ -46,14 +49,13 @@ class DefaultFilterConditionsConfig(FilterConditionsConfigBase):
         O_in_range = O > self.O_min
         D_in_range = D > self.D_min  # if m > 0 and w > 0 else False
         return tc_in_range and m_in_range and w_in_range and O_in_range and D_in_range
-            
+
 
 class LPPLS(object):
-    
-    home_dir = os.path.expanduser('~')
-    model_save_path = f'{home_dir}/.cache/lppls'
 
-    def __init__(self, observations, enable_model_cache=True):
+    home_dir = os.path.expanduser("~")
+
+    def __init__(self, observations, enable_params_cache=True):
         """
         Args:
             observations (np.array,pd.DataFrame): 2xM matrix with timestamp and observed value.
@@ -68,7 +70,8 @@ class LPPLS(object):
         self.tc_bound_coef = (0.2, 0.2)
         self.m_range = (0.1, 1.0)
         self.w_range = (6.0, 13.0)
-        self.enable_model_cache = enable_model_cache
+        self.enable_params_cache = enable_params_cache
+        self.model_save_path = f"{self.home_dir}/.cache/{self.__class__.__name__}"
 
     @staticmethod
     @njit
@@ -149,26 +152,6 @@ class LPPLS(object):
         matrix_1 += 1e-8 * np.eye(matrix_1.shape[0])
 
         return np.linalg.solve(matrix_1, matrix_2)
-    
-    def model_path(self, minimizer):
-        mp = f'{self.model_save_path}/{minimizer}/tc_{self.tc_bound_coef[0]}_{self.tc_bound_coef[1]}/m_{self.m_range[0]}_{self.m_range[1]}/w_{self.w_range[0]}_{self.w_range[1]}/'
-        os.makedirs(mp, exist_ok=True)
-        return mp
-    
-    def save_model(self, obs, minimizer, coef):
-        mp = self.model_path(minimizer)
-        sha1 = hashlib.sha1(obs.tobytes()).hexdigest()
-        with open(f'{mp}/{sha1}.pkl', 'wb') as f:
-            pickle.dump(coef, f)
-
-    def load_model(self, obs, minimizer):
-        mp = self.model_path(minimizer)
-        sha1 = hashlib.sha1(obs.tobytes()).hexdigest()
-        fp = f'{mp}/{sha1}.pkl'
-        if os.path.exists(fp):
-            with open(fp, 'rb') as f:
-                return pickle.load(f)
-        return None
 
     def fit(self, max_searches, minimizer="Nelder-Mead", obs=None):
         """
@@ -197,7 +180,7 @@ class LPPLS(object):
                 # (tc_init_min, tc_init_max),
                 (t2 - tc_low_coef * (t2 - t1), t2 + tc_up_coef * (t2 - t1)),  # tc
                 self.m_range,
-                self.w_range
+                self.w_range,
             ]
 
             # randomly choose vals within bounds for non-linear params
@@ -207,14 +190,10 @@ class LPPLS(object):
             m = non_lin_vals[1]
             w = non_lin_vals[2]
             seed = np.array([tc, m, w])
-            
-            # epsilon = 1e-8
-            # bounds = Bounds([t2+epsilon, -np.inf, -np.inf], [np.inf,np.inf,np.inf])
-            bounds = None
 
             # Increment search count on SVD convergence error, but raise all other exceptions.
             try:
-                tc, m, w, a, b, c, c1, c2 = self.estimate_params(obs, seed, minimizer, bounds)
+                tc, m, w, a, b, c, c1, c2 = self.estimate_params(obs, seed, minimizer)
                 O = self.get_oscillations(w, tc, t1, t2)
                 D = self.get_damping(m, w, b, c)
                 return tc, m, w, a, b, c, c1, c2, O, D
@@ -223,7 +202,26 @@ class LPPLS(object):
                 search_count += 1
         return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
-    def estimate_params(self, observations, seed, minimizer, bounds):
+    def estimate_params_cache(func):
+
+        @functools.wraps(func)
+        def wrapper(self, observations, seed, minimizer):
+            dp = f"{self.model_save_path}/{minimizer}/tc_{self.tc_bound_coef[0]}_{self.tc_bound_coef[1]}/m_{self.m_range[0]}_{self.m_range[1]}/w_{self.w_range[0]}_{self.w_range[1]}/"
+            sha1 = hashlib.sha1(observations.tobytes()).hexdigest()
+            fp = f"{dp}/{sha1}.pkl"
+            if self.enable_params_cache and os.path.exists(fp):
+                with open(fp, "rb") as f:
+                    return pickle.load(f)
+            coef = func(self, observations, seed, minimizer)
+            os.makedirs(dp, exist_ok=True)
+            with open(fp, "wb") as f:
+                pickle.dump(coef, f)
+            return coef
+
+        return wrapper
+
+    @estimate_params_cache
+    def estimate_params(self, observations, seed, minimizer):
         """
         Args:
             observations (np.ndarray):  the observed time-series data.
@@ -233,15 +231,9 @@ class LPPLS(object):
         Returns:
             tc, m, w, a, b, c, c1, c2
         """
-        
-        coef_names = ["tc", "m", "w", "a", "b", "c", "c1", "c2"]
-        if self.enable_model_cache:
-            coef = self.load_model(observations, minimizer)
-            if coef is not None:
-                return (coef[key] for key in coef_names)
-        
+
         cofs = minimize(
-            args=observations, fun=self.func_restricted, x0=seed, method=minimizer, bounds=bounds
+            args=observations, fun=self.func_restricted, x0=seed, method=minimizer
         )
 
         if cofs.success:
@@ -258,10 +250,8 @@ class LPPLS(object):
 
             # Use sklearn format for storing fit params
             # @TODO only save when running single fits.
-            for coef in coef_names:
+            for coef in ["tc", "m", "w", "a", "b", "c", "c1", "c2"]:
                 self.coef_[coef] = eval(coef)
-            if self.enable_model_cache:
-                self.save_model(observations, minimizer, self.coef_)
             return tc, m, w, a, b, c, c1, c2
         else:
             raise UnboundLocalError
@@ -311,8 +301,11 @@ class LPPLS(object):
         # # axes up to make room for them
         # fig.autofmt_xdate()
 
-            
-    def compute_indicators(self, res, filter_cls: FilterConditionsConfigBase = DefaultFilterConditionsConfig):
+    def compute_indicators(
+        self,
+        res,
+        filter_cls: FilterConditionsConfigBase = DefaultFilterConditionsConfig,
+    ):
         pos_lst = []
         neg_lst = []
         pos_conf_lst = []
@@ -320,6 +313,7 @@ class LPPLS(object):
         price = []
         ts = []
         _fits = []
+        tc_lst = []
 
         filter_conditions_config = filter_cls()
 
@@ -331,6 +325,7 @@ class LPPLS(object):
             pos_count = 0
             neg_count = 0
             # _fits.append(r['res'])
+            qualified_tc = []
 
             for idx, fits in enumerate(r["res"]):
                 t1 = fits["t1"]
@@ -358,6 +353,13 @@ class LPPLS(object):
                 # print('______________')
 
                 if filter_conditions_config.is_qualified(t1, t2, tc, m, w, b, c, O, D):
+                    qualified_tc.append(
+                        (
+                            filter_cls.fromordinal(int(tc)),
+                            filter_cls.fromordinal(int(t2)),
+                            filter_cls.fromordinal(int(t1)),
+                        )
+                    )
                     is_qualified = True
                 else:
                     is_qualified = False
@@ -383,7 +385,7 @@ class LPPLS(object):
             # pos_lst.append(pos_count / (pos_count + neg_count))
             # neg_lst.append(neg_count / (pos_count + neg_count))
 
-            # tc_lst.append(tc_cnt)
+            tc_lst.append(qualified_tc)
             # m_lst.append(m_cnt)
             # w_lst.append(w_cnt)
             # O_lst.append(O_cnt)
@@ -391,7 +393,8 @@ class LPPLS(object):
 
         res_df = pd.DataFrame(
             {
-                "time": [date.fromordinal(int(t)) for t in ts],
+                "time": ts,
+                "tc_lst":tc_lst,
                 "price": price,
                 "pos_conf": pos_conf_lst,
                 "neg_conf": neg_conf_lst,
@@ -400,14 +403,12 @@ class LPPLS(object):
         )
         return res_df
         # return ts, price, pos_lst, neg_lst, pos_conf_lst, neg_conf_lst, #tc_lst, m_lst, w_lst, O_lst, D_lst
-        
-    def plot_estimate_params(self, r:xr.DataArray):
-        fig, axs = plt.subplots(8, 1, figsize=(36, 20))
-        for i, param in enumerate(["a", "b", "c", "m", "w"]):
-            axs[i].plot(r.loc[0,:,param])
-        plt.tight_layout()
-                
-    def plot_confidence_indicators(self, res, filter_cls: FilterConditionsConfigBase = DefaultFilterConditionsConfig):
+
+    def plot_confidence_indicators(
+        self,
+        res,
+        filter_cls: FilterConditionsConfigBase = DefaultFilterConditionsConfig,
+    ):
         """
         Args:
             res (list): result from mp_compute_indicator
@@ -420,7 +421,7 @@ class LPPLS(object):
         fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, sharex=True, figsize=(18, 10))
 
         ord = res_df["time"].astype("int32")
-        ts = [pd.Timestamp.fromordinal(d) for d in ord]
+        ts = [filter_cls.fromordinal(d) for d in ord]
 
         # plot pos bubbles
         ax1_0 = ax1.twinx()
@@ -531,7 +532,6 @@ class LPPLS(object):
         res = []
         i_idx = 0
         for i in range(0, obs_copy_len + 1, outer_increment):
-            print(i)
             j_idx = 0
             obs = obs_copy[:, i : window_size + i]
             t1 = obs[0][0]
@@ -553,7 +553,20 @@ class LPPLS(object):
             coords=dict(
                 t2=obs_copy[0][(window_size - 1) :],
                 windowsizes=range(smallest_window_size, window_size, inner_increment),
-                params=["t2", "t1", "a", "b", "c", "m", "w", "tc", "c1", "c2", "O", "D"],
+                params=[
+                    "t2",
+                    "t1",
+                    "a",
+                    "b",
+                    "c",
+                    "m",
+                    "w",
+                    "tc",
+                    "c1",
+                    "c2",
+                    "O",
+                    "D",
+                ],
             ),
         )
 
