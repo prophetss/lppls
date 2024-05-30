@@ -1,61 +1,34 @@
 import functools
-from multiprocessing import Pool
-from matplotlib import pyplot as plt
-from numba import njit
-import numpy as np
-import pandas as pd
+import hashlib
+import os
 import random
 from datetime import datetime as date
-from pandas._libs.tslibs.np_datetime import OutOfBoundsDatetime
-from scipy.optimize import minimize, Bounds
-from abc import ABC, abstractmethod
-import pickle
-from tqdm import tqdm
-import hashlib
+from multiprocessing import Pool
+
+import numpy as np
+import pandas as pd
 import xarray as xr
-import os
-
-
-class FilterConditionsConfigBase(ABC):
-    @abstractmethod
-    def is_qualified(self, t1, t2, tc, m, w, b, c, O, D):
-        pass
-
-
-class DefaultFilterConditionsConfig(FilterConditionsConfigBase):
-    m_min = 0.0
-    m_max = 1.0
-    w_min = 2.0
-    w_max = 15.0
-    O_min = 2.5
-    D_min = 0.5
-
-    fromordinal = date.fromordinal
-
-    def is_qualified(self, t1, t2, tc, m, w, b, c, O, D):
-        tc_in_range = (
-            max(t2 - 60, t2 - 0.5 * (t2 - t1))
-            < tc
-            < min(t2 + 252, t2 + 0.5 * (t2 - t1))
-        )
-        m_in_range = self.m_min < m < self.m_max
-        w_in_range = self.w_min < w < self.w_max
-
-        if b != 0 and c != 0:
-            O = O
-        else:
-            O = np.inf
-
-        O_in_range = O > self.O_min
-        D_in_range = D > self.D_min  # if m > 0 and w > 0 else False
-        return tc_in_range and m_in_range and w_in_range and O_in_range and D_in_range
+from filelock import FileLock
+from matplotlib import pyplot as plt
+from numba import njit
+from pandas._libs.tslibs.np_datetime import OutOfBoundsDatetime
+from scipy.optimize import minimize
+from tqdm import tqdm
 
 
 class LPPLS(object):
 
     home_dir = os.path.expanduser("~")
 
-    def __init__(self, observations, enable_params_cache=True):
+    def __init__(
+        self,
+        observations,
+        minimizer="Nelder-Mead",
+        tc_bound_coef=(0.2, 0.2),
+        m_range=(0.1, 1.0),
+        w_range=(6.0, 13.0),
+        enable_params_cache=True,
+    ):
         """
         Args:
             observations (np.array,pd.DataFrame): 2xM matrix with timestamp and observed value.
@@ -67,11 +40,20 @@ class LPPLS(object):
         self.observations = observations
         self.coef_ = {}
         self.indicator_result = []
-        self.tc_bound_coef = (0.2, 0.2)
-        self.m_range = (0.1, 1.0)
-        self.w_range = (6.0, 13.0)
+        self.tc_bound_coef = tc_bound_coef
+        self.m_range = m_range
+        self.w_range = w_range
+        self.minimizer = minimizer
+        self.cache_init(enable_params_cache)
+
+    def cache_init(self, enable_params_cache):
         self.enable_params_cache = enable_params_cache
-        self.model_save_path = f"{self.home_dir}/.cache/{self.__class__.__name__}"
+        if enable_params_cache:
+            cache_dir = f"{self.home_dir}/.cache/{self.__class__.__name__}/{self.minimizer}/tc_{self.tc_bound_coef[0]}_{self.tc_bound_coef[1]}_m_{self.m_range[0]}_{self.m_range[1]}_w_{self.w_range[0]}_{self.w_range[1]}/"
+            self.cache_data_dir = f"{cache_dir}data/"
+            self.cache_lock_dir = f"{cache_dir}lock/"
+            os.makedirs(self.cache_data_dir, exist_ok=True)
+            os.makedirs(self.cache_lock_dir, exist_ok=True)
 
     @staticmethod
     @njit
@@ -153,7 +135,7 @@ class LPPLS(object):
 
         return np.linalg.solve(matrix_1, matrix_2)
 
-    def fit(self, max_searches, minimizer="Nelder-Mead", obs=None):
+    def fit(self, max_searches, obs=None):
         """
         Args:
             max_searches (int): The maxi amount of searches to perform before giving up. The literature suggests 25.
@@ -193,7 +175,7 @@ class LPPLS(object):
 
             # Increment search count on SVD convergence error, but raise all other exceptions.
             try:
-                tc, m, w, a, b, c, c1, c2 = self.estimate_params(obs, seed, minimizer)
+                tc, m, w, a, b, c, c1, c2 = self.estimate_params(obs, seed)
                 O = self.get_oscillations(w, tc, t1, t2)
                 D = self.get_damping(m, w, b, c)
                 return tc, m, w, a, b, c, c1, c2, O, D
@@ -205,23 +187,33 @@ class LPPLS(object):
     def estimate_params_cache(func):
 
         @functools.wraps(func)
-        def wrapper(self, observations, seed, minimizer):
-            dp = f"{self.model_save_path}/{minimizer}/tc_{self.tc_bound_coef[0]}_{self.tc_bound_coef[1]}/m_{self.m_range[0]}_{self.m_range[1]}/w_{self.w_range[0]}_{self.w_range[1]}/"
-            sha1 = hashlib.sha1(observations.tobytes()).hexdigest()
-            fp = f"{dp}/{sha1}.pkl"
-            if self.enable_params_cache and os.path.exists(fp):
-                with open(fp, "rb") as f:
-                    return pickle.load(f)
-            coef = func(self, observations, seed, minimizer)
-            os.makedirs(dp, exist_ok=True)
-            with open(fp, "wb") as f:
-                pickle.dump(coef, f)
-            return coef
+        def wrapper(self, observations, seed):
+            if self.enable_params_cache:
+                sha1 = hashlib.sha1(observations.tobytes()).hexdigest()
+                # 4 char prefix maximizes 65536 files in a directory
+                with FileLock(f"{self.cache_lock_dir}/{sha1[:4]}.lock"):
+                    fp = f"{self.cache_data_dir}/{sha1[:4]}.parquet"
+                    if os.path.exists(fp):
+                        df = pd.read_parquet(fp)
+                    else:
+                        df = pd.DataFrame(
+                            columns=["sha1", "tc", "m", "w", "a", "b", "c", "c1", "c2"]
+                        )
+                        df.set_index("sha1", inplace=True)
+                    if sha1 in df.index:
+                        res = df.loc[sha1].values
+                    else:
+                        res = func(self, observations, seed)
+                        df.loc[sha1] = res
+                        df.to_parquet(fp)
+                return res
+            else:
+                return func(self, observations, seed)
 
         return wrapper
 
     @estimate_params_cache
-    def estimate_params(self, observations, seed, minimizer):
+    def estimate_params(self, observations, seed):
         """
         Args:
             observations (np.ndarray):  the observed time-series data.
@@ -233,7 +225,7 @@ class LPPLS(object):
         """
 
         cofs = minimize(
-            args=observations, fun=self.func_restricted, x0=seed, method=minimizer
+            args=observations, fun=self.func_restricted, x0=seed, method=self.minimizer
         )
 
         if cofs.success:
@@ -301,11 +293,44 @@ class LPPLS(object):
         # # axes up to make room for them
         # fig.autofmt_xdate()
 
+    @staticmethod
     def compute_indicators(
-        self,
         res,
-        filter_cls: FilterConditionsConfigBase = DefaultFilterConditionsConfig,
+        filter_config={},
     ):
+        def _is_qualified(t1, t2, tc, m, w, b, c, O, D, cfg):
+            tc_in_range = (
+                max(t2 - 60, t2 - 0.5 * (t2 - t1))
+                < tc
+                < min(t2 + 252, t2 + 0.5 * (t2 - t1))
+            )
+            m_in_range = cfg["m_min"] < m < cfg["m_max"]
+            w_in_range = cfg["w_min"] < w < cfg["w_max"]
+
+            if b != 0 and c != 0:
+                O = O
+            else:
+                O = np.inf
+
+            O_in_range = O > cfg["O_min"]
+            D_in_range = D > cfg["D_min"]  # if m > 0 and w > 0 else False
+            return (
+                tc_in_range and m_in_range and w_in_range and O_in_range and D_in_range
+            )
+
+        _filter_config = {
+            "m_min": 0.0,
+            "m_max": 1.0,
+            "w_min": 2.0,
+            "w_max": 15.0,
+            "O_min": 2.5,
+            "D_min": 0.5,
+            "fromordinal": date.fromordinal,
+            "is_qualified": _is_qualified,
+        }
+        for k, v in filter_config.items():
+            _filter_config[k] = v
+
         pos_lst = []
         neg_lst = []
         pos_conf_lst = []
@@ -314,8 +339,6 @@ class LPPLS(object):
         ts = []
         _fits = []
         tc_lst = []
-
-        filter_conditions_config = filter_cls()
 
         for r in res:
             ts.append(r["t2"])
@@ -351,7 +374,9 @@ class LPPLS(object):
                 # print('{} < {} < {}'.format(max(t2 - 60, t2 - 0.5 * (t2 - t1)), tc, min(t2 + 252, t2 + 0.5 * (t2 - t1))))
                 # print('______________')
 
-                if filter_conditions_config.is_qualified(t1, t2, tc, m, w, b, c, O, D):
+                if _filter_config["_is_qualified"](
+                    t1, t2, tc, m, w, b, c, O, D, _filter_config
+                ):
                     is_qualified = True
                 else:
                     is_qualified = False
@@ -398,7 +423,7 @@ class LPPLS(object):
     def plot_confidence_indicators(
         self,
         res,
-        filter_cls: FilterConditionsConfigBase = DefaultFilterConditionsConfig,
+        filter_config={},
     ):
         """
         Args:
@@ -408,11 +433,11 @@ class LPPLS(object):
         Returns:
             nothing, should plot the indicator
         """
-        res_df = self.compute_indicators(res, filter_cls)
+        res_df = self.compute_indicators(res, filter_config)
         fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, sharex=True, figsize=(18, 10))
 
         ord = res_df["time"].astype("int32")
-        ts = [filter_cls.fromordinal(d) for d in ord]
+        ts = [filter_config["fromordinal"](d) for d in ord]
 
         # plot pos bubbles
         ax1_0 = ax1.twinx()
@@ -474,13 +499,12 @@ class LPPLS(object):
 
     def mp_compute_nested_fits(
         self,
-        workers,
+        workers=None,
         window_size=80,
         smallest_window_size=20,
         outer_increment=5,
         inner_increment=2,
         max_searches=25,
-        filter_conditions_config={},
     ):
         obs_copy = self.observations
         obs_opy_len = len(obs_copy[0]) - window_size
@@ -488,6 +512,8 @@ class LPPLS(object):
 
         # print('obs_copy', obs_copy)
         # print('obs_opy_len', obs_opy_len)
+        if workers is None:
+            workers = max(os.cpu_count() - 4, 1)
 
         func_arg_map = [
             (
@@ -646,7 +672,7 @@ class LPPLS(object):
             )
 
         # return {'t1': self.ordinal_to_date(t1), 't2': self.ordinal_to_date(t2), 'p2': p2, 'res': res}
-        return {"t1": t1, "t2": t2, "p2": p2, "res": res}
+        return {"t1": t1, "t2": t2, "p1": p1, "p2": p2, "res": res}
 
     def _get_tc_bounds(self, obs, lower_bound_pct, upper_bound_pct):
         """
