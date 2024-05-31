@@ -328,8 +328,12 @@ class LPPLS(object):
             "fromordinal": date.fromordinal,
             "is_qualified": _is_qualified,
         }
+        
         for k, v in filter_config.items():
             _filter_config[k] = v
+            
+        if isinstance(res, pd.DataFrame):
+            res = res.to_dict(orient="records")
 
         pos_lst = []
         neg_lst = []
@@ -374,7 +378,7 @@ class LPPLS(object):
                 # print('{} < {} < {}'.format(max(t2 - 60, t2 - 0.5 * (t2 - t1)), tc, min(t2 + 252, t2 + 0.5 * (t2 - t1))))
                 # print('______________')
 
-                if _filter_config["_is_qualified"](
+                if _filter_config["is_qualified"](
                     t1, t2, tc, m, w, b, c, O, D, _filter_config
                 ):
                     is_qualified = True
