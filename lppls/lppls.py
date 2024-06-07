@@ -294,30 +294,29 @@ class LPPLS(object):
         # fig.autofmt_xdate()
 
     @staticmethod
+    def _is_qualified(t1, t2, tc, m, w, b, c, O, D, cfg):
+        tc_in_range = (
+            max(t2 - 0, t2 - 0.5 * (t2 - t1)) < tc < min(t2 + 252, t2 + 0.5 * (t2 - t1))
+        )
+        m_in_range = cfg["m_min"] < m < cfg["m_max"]
+        w_in_range = cfg["w_min"] < w < cfg["w_max"]
+
+        if b != 0 and c != 0:
+            O = O
+        else:
+            O = np.inf
+
+        O_in_range = O > cfg["O_min"]
+        D_in_range = D > cfg["D_min"]  # if m > 0 and w > 0 else False
+        return tc_in_range and m_in_range and w_in_range and O_in_range and D_in_range
+
+    @staticmethod
     def compute_indicators(
         res,
         filter_config={},
+        qualified_func=_is_qualified,
+        fromordinal=date.fromordinal,
     ):
-        def _is_qualified(t1, t2, tc, m, w, b, c, O, D, cfg):
-            tc_in_range = (
-                max(t2 - 60, t2 - 0.5 * (t2 - t1))
-                < tc
-                < min(t2 + 252, t2 + 0.5 * (t2 - t1))
-            )
-            m_in_range = cfg["m_min"] < m < cfg["m_max"]
-            w_in_range = cfg["w_min"] < w < cfg["w_max"]
-
-            if b != 0 and c != 0:
-                O = O
-            else:
-                O = np.inf
-
-            O_in_range = O > cfg["O_min"]
-            D_in_range = D > cfg["D_min"]  # if m > 0 and w > 0 else False
-            return (
-                tc_in_range and m_in_range and w_in_range and O_in_range and D_in_range
-            )
-
         _filter_config = {
             "m_min": 0.0,
             "m_max": 1.0,
@@ -325,13 +324,11 @@ class LPPLS(object):
             "w_max": 15.0,
             "O_min": 2.5,
             "D_min": 0.5,
-            "fromordinal": date.fromordinal,
-            "is_qualified": _is_qualified,
         }
-        
+
         for k, v in filter_config.items():
             _filter_config[k] = v
-            
+
         if isinstance(res, pd.DataFrame):
             res = res.to_dict(orient="records")
 
@@ -352,6 +349,7 @@ class LPPLS(object):
             pos_count = 0
             neg_count = 0
             # _fits.append(r['res'])
+            qualified_tc = []
 
             for idx, fits in enumerate(r["res"]):
                 t1 = fits["t1"]
@@ -378,9 +376,14 @@ class LPPLS(object):
                 # print('{} < {} < {}'.format(max(t2 - 60, t2 - 0.5 * (t2 - t1)), tc, min(t2 + 252, t2 + 0.5 * (t2 - t1))))
                 # print('______________')
 
-                if _filter_config["is_qualified"](
-                    t1, t2, tc, m, w, b, c, O, D, _filter_config
-                ):
+                if qualified_func(t1, t2, tc, m, w, b, c, O, D, _filter_config):
+                    qualified_tc.append(
+                        (
+                            date.fromordinal(int(tc)),
+                            date.fromordinal(int(t2)),
+                            date.fromordinal(int(t1)),
+                        )
+                    )
                     is_qualified = True
                 else:
                     is_qualified = False
@@ -406,7 +409,7 @@ class LPPLS(object):
             # pos_lst.append(pos_count / (pos_count + neg_count))
             # neg_lst.append(neg_count / (pos_count + neg_count))
 
-            # tc_lst.append(tc_cnt)
+            tc_lst.append(qualified_tc)
             # m_lst.append(m_cnt)
             # w_lst.append(w_cnt)
             # O_lst.append(O_cnt)
@@ -416,6 +419,7 @@ class LPPLS(object):
             {
                 "time": ts,
                 "price": price,
+                "tc_lst": tc_lst,
                 "pos_conf": pos_conf_lst,
                 "neg_conf": neg_conf_lst,
                 "_fits": _fits,
@@ -428,6 +432,8 @@ class LPPLS(object):
         self,
         res,
         filter_config={},
+        qualified_func=_is_qualified,
+        fromordinal=date.fromordinal,
     ):
         """
         Args:
@@ -437,11 +443,13 @@ class LPPLS(object):
         Returns:
             nothing, should plot the indicator
         """
-        res_df = self.compute_indicators(res, filter_config)
+        res_df = self.compute_indicators(
+            res, filter_config, qualified_func, fromordinal
+        )
         fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, sharex=True, figsize=(18, 10))
 
         ord = res_df["time"].astype("int32")
-        ts = [filter_config["fromordinal"](d) for d in ord]
+        ts = [fromordinal(d) for d in ord]
 
         # plot pos bubbles
         ax1_0 = ax1.twinx()
