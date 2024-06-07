@@ -296,7 +296,9 @@ class LPPLS(object):
     @staticmethod
     def _is_qualified(t1, t2, tc, m, w, b, c, O, D, cfg):
         tc_in_range = (
-            max(t2 - 0, t2 - 0.5 * (t2 - t1)) < tc < min(t2 + 252, t2 + 0.5 * (t2 - t1))
+            max(t2 - 60, t2 - 0.5 * (t2 - t1))
+            < tc
+            < min(t2 + 252, t2 + 0.5 * (t2 - t1))
         )
         m_in_range = cfg["m_min"] < m < cfg["m_max"]
         w_in_range = cfg["w_min"] < w < cfg["w_max"]
