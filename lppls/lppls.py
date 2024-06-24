@@ -381,9 +381,9 @@ class LPPLS(object):
                 if qualified_func(t1, t2, tc, m, w, b, c, O, D, _filter_config):
                     qualified_tc.append(
                         (
-                            date.fromordinal(int(tc)),
-                            date.fromordinal(int(t2)),
-                            date.fromordinal(int(t1)),
+                            fromordinal(int(tc)),
+                            fromordinal(int(t2)),
+                            fromordinal(int(t1)),
                         )
                     )
                     is_qualified = True
