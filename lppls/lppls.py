@@ -315,9 +315,9 @@ class LPPLS(object):
     @staticmethod
     def compute_indicators(
         res,
-        filter_config={},
-        qualified_func=_is_qualified,
-        fromordinal=date.fromordinal,
+        filter_config=None,
+        qualified_func=None,
+        fromordinal=None,
     ):
         _filter_config = {
             "m_min": 0.0,
@@ -328,8 +328,15 @@ class LPPLS(object):
             "D_min": 0.5,
         }
 
-        for k, v in filter_config.items():
-            _filter_config[k] = v
+        if filter_config is not None:
+            for k, v in filter_config.items():
+                _filter_config[k] = v
+
+        if qualified_func is None:
+            qualified_func = LPPLS._is_qualified
+
+        if fromordinal is None:
+            fromordinal = date.fromordinal
 
         if isinstance(res, pd.DataFrame):
             res = res.to_dict(orient="records")
@@ -433,9 +440,9 @@ class LPPLS(object):
     def plot_confidence_indicators(
         self,
         res,
-        filter_config={},
-        qualified_func=_is_qualified,
-        fromordinal=date.fromordinal,
+        filter_config=None,
+        qualified_func=None,
+        fromordinal=None,
     ):
         """
         Args:
